@@ -26,13 +26,14 @@
     2. |区间涨跌幅| >= THRESHOLD_PCT
     3. 该方向不在冷却期内
 
-环境变量
-    WECOM_WEBHOOK  企业微信机器人 Webhook 地址（必填，配置在仓库 Secrets）
+环境变量（至少配一个；都配则两渠道都发）
+    PUSHPLUS_TOKEN  推送加 PushPlus token（默认渠道，消息直达个人微信）
+    WECOM_WEBHOOK   企业微信机器人 Webhook（可选，另发一份到企业微信群）
 
 用法
     python3 monitor.py                 正常运行：读状态 → 判定 → 推送
     python3 monitor.py --dry-run       只打印不推送，用于验证
-    python3 monitor.py --test-webhook  发一条测试消息，验证机器人配置
+    python3 monitor.py --test-webhook  向所有已配置渠道发送测试消息
 ============================================================================
 """
 
@@ -192,7 +193,7 @@ def evaluate(quote, state, now, threshold):
 
 
 # --------------------------------------------------------------------------
-# 4. 企业微信推送
+# 4. 告警推送（PushPlus 个人微信 / 企业微信，可并存）
 # --------------------------------------------------------------------------
 def build_message(quote, detail):
     pct = detail["pct"]
@@ -229,24 +230,93 @@ def send_wecom(webhook, content):
     return result
 
 
-def test_webhook():
+def _message_title(content):
+    """从 markdown 正文提取标题（取第一个 # 开头的行）。"""
+    for line in content.splitlines():
+        line = line.strip()
+        if line.startswith("#"):
+            return line.lstrip("# ").strip()
+    return "上海金 T+D 价格异动"
+
+
+PUSHPLUS_API = "https://www.pushplus.plus/send"
+
+
+def send_pushplus(token, title, content):
+    payload = {"token": token, "title": title,
+               "content": content, "template": "markdown"}
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        PUSHPLUS_API, data=data,
+        headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        body = resp.read().decode("utf-8", errors="replace")
+    result = json.loads(body)
+    if result.get("code") != 200:
+        raise RuntimeError(f"PushPlus 返回错误：{body}")
+    return result
+
+
+def send_alert(content):
+    """按配置把告警推送到所有渠道。
+
+    返回 (成功渠道列表, 失败原因列表)。任一渠道失败都只记录、不抛错，
+    保证状态照常回写（推送失败不应影响下次采样基准）。
+    """
+    sent, errors = [], []
     webhook = os.environ.get("WECOM_WEBHOOK", "").strip()
-    if not webhook:
-        print("[错误] 环境变量 WECOM_WEBHOOK 未设置。", file=sys.stderr)
-        return 1
+    token = os.environ.get("PUSHPLUS_TOKEN", "").strip()
+
+    if token:
+        try:
+            send_pushplus(token, _message_title(content), content)
+            sent.append("PushPlus(微信)")
+        except Exception as exc:                      # noqa: BLE001
+            errors.append(f"PushPlus：{exc}")
+    if webhook:
+        try:
+            send_wecom(webhook, content)
+            sent.append("企业微信")
+        except Exception as exc:                      # noqa: BLE001
+            errors.append(f"企业微信：{exc}")
+
+    if not token and not webhook:
+        raise RuntimeError("未配置任何推送渠道（请设置 PUSHPLUS_TOKEN 或 WECOM_WEBHOOK）")
+    return sent, errors
+
+
+def test_webhook():
+    """向所有已配置的渠道发送测试消息。"""
+    now_str = f"{datetime.now(CST):%Y-%m-%d %H:%M:%S}"
     content = "\n".join([
         "## ✅ 金价监控已连通",
-        "这是一条测试消息，收到说明企业微信机器人配置正确。",
+        "这是一条测试消息，收到说明推送渠道配置正确。",
         "",
-        f"> 发送时间：{datetime.now(CST):%Y-%m-%d %H:%M:%S}",
+        f"> 发送时间：{now_str}",
     ])
-    try:
-        send_wecom(webhook, content)
-        print("[成功] 测试消息已发送，请检查企业微信群。")
-        return 0
-    except Exception as exc:                          # noqa: BLE001
-        print(f"[失败] {exc}", file=sys.stderr)
+    webhook = os.environ.get("WECOM_WEBHOOK", "").strip()
+    token = os.environ.get("PUSHPLUS_TOKEN", "").strip()
+    if not webhook and not token:
+        print("[错误] 未配置推送渠道：请设置 PUSHPLUS_TOKEN 或 WECOM_WEBHOOK。",
+              file=sys.stderr)
         return 1
+
+    ok = True
+    if token:
+        try:
+            send_pushplus(token, _message_title(content), content)
+            print("[成功] PushPlus(微信) 测试消息已发送，请查看个人微信。")
+        except Exception as exc:                      # noqa: BLE001
+            ok = False
+            print(f"[失败] PushPlus：{exc}", file=sys.stderr)
+    if webhook:
+        try:
+            send_wecom(webhook, content)
+            print("[成功] 企业微信测试消息已发送，请检查企业微信群。")
+        except Exception as exc:                      # noqa: BLE001
+            ok = False
+            print(f"[失败] 企业微信：{exc}", file=sys.stderr)
+    return 0 if ok else 1
 
 
 # --------------------------------------------------------------------------
@@ -258,7 +328,12 @@ def main():
     parser.add_argument("--threshold", type=float, default=THRESHOLD_PCT,
                         help=f"触发阈值百分比（默认 {THRESHOLD_PCT}）")
     parser.add_argument("--dry-run", action="store_true", help="只打印，不推送")
+    parser.add_argument("--test-webhook", action="store_true",
+                        help="向所有已配置的推送渠道发送测试消息后退出")
     args = parser.parse_args()
+
+    if args.test_webhook:
+        return test_webhook()
 
     now = datetime.now(CST)
     now_epoch = now.timestamp()
@@ -295,14 +370,16 @@ def main():
         print("-" * 50)
         print(message)
         print("-" * 50)
-        webhook = os.environ.get("WECOM_WEBHOOK", "").strip()
         if args.dry_run:
             print("[跳过] --dry-run 模式，未推送。")
-        elif not webhook:
-            print("[警告] 未配置 WECOM_WEBHOOK，无法推送。", file=sys.stderr)
         else:
-            send_wecom(webhook, message)
-            print("[推送] 已发送至企业微信。")
+            try:
+                sent, errors = send_alert(message)
+                print(f"[推送] 已发送：{', '.join(sent) if sent else '无'}")
+                for err in errors:
+                    print(f"[推送失败] {err}", file=sys.stderr)
+            except RuntimeError as exc:
+                print(f"[警告] {exc}", file=sys.stderr)
     else:
         print(f"[正常] {detail}")
 

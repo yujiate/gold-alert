@@ -10,6 +10,15 @@ on:
     # 脚本按「真实采样间隔」校验后才判定，因此延迟只会导致漏报，不会误报。
     - cron: '*/5 * * * *'
   workflow_dispatch:      # 允许在 Actions 页面手动触发测试
+    inputs:
+      mode:
+        description: '运行模式：test=发测试消息；normal=正常监控'
+        required: false
+        default: normal
+        type: choice
+        options:
+          - normal
+          - test
 
 permissions:
   contents: write         # 需要把 state.json 提交回仓库
@@ -34,8 +43,14 @@ jobs:
 
       - name: 执行监控
         env:
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
-        run: python monitor.py
+        run: |
+          if [ "${{ github.event.inputs.mode }}" = "test" ]; then
+            python monitor.py --test-webhook
+          else
+            python monitor.py
+          fi
 
       - name: 回写状态
         run: |

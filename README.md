@@ -1,7 +1,8 @@
 # 上海金 T+D 价格异动监控
 
 每 5 分钟检查一次上海黄金交易所「黄金延期」（Au T+D，人民币元/克），
-出现 **1% 以上急涨急跌** 时，通过企业微信机器人推送告警。
+出现 **1% 以上急涨急跌** 时，通过 PushPlus 推送到**个人微信**
+（也可选配企业微信机器人作为第二渠道）。
 
 - 数据源：新浪财经公开接口，无需鉴权
 - 运行环境：GitHub Actions，不占用本地机器，关机也能跑
@@ -25,15 +26,11 @@ git remote add origin git@github.com:<你的用户名>/gold-alert.git
 git push -u origin main
 ```
 
-### 2. 获取企业微信机器人 Webhook
+### 2. 获取 PushPlus token（推送到个人微信）
 
-1. 在企业微信中建一个群（可以只有你自己）
-2. 群设置 → 群机器人 → 添加机器人
-3. 复制 Webhook 地址，形如：
-
-   ```
-   https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-   ```
+1. 打开 <https://www.pushplus.plus/>，**微信扫码登录**
+2. 左侧菜单进入「一对一推送」，复制你的 **token**（一串字符）
+3. 可选：如还想另发一份到企业微信群，可再按旧版说明配置 `WECOM_WEBHOOK`
 
 ### 3. 配置为仓库 Secret
 
@@ -41,23 +38,25 @@ git push -u origin main
 
 | Name | Value |
 | --- | --- |
-| `WECOM_WEBHOOK` | 上一步复制的完整 Webhook 地址 |
+| `PUSHPLUS_TOKEN` | PushPlus 个人 token（必配） |
+| `WECOM_WEBHOOK` | 企业微信机器人 Webhook（可选，二渠道并存） |
 
 密钥不会出现在运行日志中，脚本通过环境变量读取。
 
 ### 4. 验证
 
-`Actions` → 选「上海金 T+D 异动监控」→ `Run workflow` → 手动触发一次。
+`Actions` → 选「上海金 T+D 异动监控」→ `Run workflow` → 手动触发一次
+（`mode` 选 `test` 会直接发一条测试消息到微信）。
 
-首次运行只会记录基准价、不会告警，之后每 5 分钟自动检查。
+首次 `normal` 运行只会记录基准价、不会告警，之后每 5 分钟自动检查。
 
-想立刻确认机器人是否连通，可在本机执行：
+想立刻确认通道是否连通，可在本机执行：
 
 ```bash
-WECOM_WEBHOOK=<你的地址> python3 monitor.py --test-webhook
+PUSHPLUS_TOKEN=<你的token> python3 monitor.py --test-webhook
 ```
 
-看到企业微信群收到「金价监控已连通」即配置成功。
+看到微信收到「金价监控已连通」即配置成功。
 
 ---
 
