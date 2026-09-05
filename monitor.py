@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+上海金 T+D（gds_AUTD）价格异动监控 —— GitHub Actions 版
+============================================================================
+数据源
+    新浪财经实时接口 hq.sinajs.cn，无需鉴权，任意网络环境可调用。
+    标的 gds_AUTD = 上海黄金交易所「黄金延期」，人民币元/克，
+    是国内金条、首饰定价的主要参照。
+
+为什么不用 westock
+    westock CLI 依赖本机 127.0.0.1 代理与会话级 token，云端无法使用。
+    （已验证：东财无上海金 secid，新浪分钟线接口已下线，故只能用实时快照。）
+
+跨运行状态持久化
+    GitHub Actions 每次运行都是全新容器，本地文件不留存。因此把
+    「上一次采样的价格与时间」写入 state.json 并提交回仓库，下次运行读取，
+    两次采样之差即为 N 分钟涨跌幅。
+
+    ⚠️ 关键设计：GitHub 的 schedule cron 并不准时，常有 5~15 分钟漂移。
+    因此判定时会校验「真实间隔」是否落在有效窗口内，并在消息里写明实际跨度，
+    绝不把一次 40 分钟的漂移当成 5 分钟异动报出去。
+
+告警规则（三个条件同时满足）
+    1. 距上次采样 elapsed ∈ [MIN_ELAPSED, MAX_ELAPSED] 秒
+    2. |区间涨跌幅| >= THRESHOLD_PCT
+    3. 该方向不在冷却期内
+
+环境变量
+    WECOM_WEBHOOK  企业微信机器人 Webhook 地址（必填，配置在仓库 Secrets）
+
+用法
+    python3 monitor.py                 正常运行：读状态 → 判定 → 推送
+    python3 monitor.py --dry-run       只打印不推送，用于验证
+    python3 monitor.py --test-webhook  发一条测试消息，验证机器人配置
+============================================================================
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+import urllib.request
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+# --------------------------------------------------------------------------
+# 配置
+# --------------------------------------------------------------------------
+CST = ZoneInfo("Asia/Shanghai")
+SINA_URL = "https://hq.sinajs.cn/list=gds_AUTD"
+SYMBOL = "gds_AUTD"
+USER_AGENT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+THRESHOLD_PCT = 1.0      # 触发阈值（%），取绝对值
+MIN_ELAPSED = 120        # 最短有效间隔（秒）：短于此说明调度异常，不判定
+MAX_ELAPSED = 1800       # 最长有效间隔（秒）：跨休市或调度漂移过大则不判定
+COOLDOWN = 1800          # 同方向冷却期（秒）
+STALE_QUOTE = 900        # 行情陈旧阈值（秒）：超过视为休市，只记录不判定
+MAX_RETRY = 3            # 行情获取重试次数
+
+
+# --------------------------------------------------------------------------
+# 1. 行情获取与解析
+# --------------------------------------------------------------------------
+def fetch_quote():
+    """获取实时行情，失败自动重试。"""
+    last_err = None
+    for attempt in range(MAX_RETRY):
+        try:
+            req = urllib.request.Request(SINA_URL, headers={
+                "Referer": "https://finance.sina.com.cn",
+                "User-Agent": USER_AGENT,
+            })
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                text = resp.read().decode("gbk", errors="replace")
+            return parse_quote(text)
+        except Exception as exc:                      # noqa: BLE001
+            last_err = exc
+            if attempt < MAX_RETRY - 1:
+                time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"行情获取失败（已重试 {MAX_RETRY} 次）：{last_err}")
+
+
+def parse_quote(text):
+    """解析新浪 gds_ 系列行情。
+
+    字段顺序（实测）：
+        0 现价 / 2 买价 / 3 卖价 / 4 最高 / 5 最低 / 6 时间
+        7 昨收 / 8 今开 / 9 成交量 / 12 日期 / 13 名称
+    """
+    match = re.search(r'var hq_str_%s="([^"]*)"' % SYMBOL, text)
+    if not match:
+        raise RuntimeError("响应中未找到行情数据（可能接口变更或被限流）")
+    fields = match.group(1).split(",")
+    if len(fields) < 14:
+        raise RuntimeError(f"行情字段数异常，期望 >=14 实际 {len(fields)}")
+
+    def num(value):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+
+    return {
+        "name": fields[13],
+        "price": num(fields[0]),
+        "bid": num(fields[2]),
+        "ask": num(fields[3]),
+        "high": num(fields[4]),
+        "low": num(fields[5]),
+        "prev_close": num(fields[7]),
+        "open": num(fields[8]),
+        "volume": num(fields[9]),
+        "quote_date": fields[12],
+        "quote_time": fields[6],
+    }
+
+
+def quote_epoch(quote):
+    """把行情自带的日期+时间转成 epoch（按北京时间）。"""
+    try:
+        naive = datetime.strptime(f"{quote['quote_date']} {quote['quote_time']}",
+                                  "%Y-%m-%d %H:%M:%S")
+        return naive.replace(tzinfo=CST).timestamp()
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+# --------------------------------------------------------------------------
+# 2. 状态持久化
+# --------------------------------------------------------------------------
+def load_state(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            state = json.load(handle)
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        state = {}
+    state.setdefault("last", None)
+    state.setdefault("last_trigger", {"up": 0.0, "down": 0.0})
+    state.setdefault("runs", 0)
+    return state
+
+
+def save_state(path, state):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(state, handle, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+# --------------------------------------------------------------------------
+# 3. 判定
+# --------------------------------------------------------------------------
+def evaluate(quote, state, now, threshold):
+    """返回 (verdict, detail)。verdict: alert / skip / cooldown"""
+    prev = state.get("last")
+    if not prev or not prev.get("price"):
+        return "skip", "首次运行，已记录基准价"
+
+    elapsed = now - prev["epoch"]
+    if elapsed < MIN_ELAPSED:
+        return "skip", f"间隔过短（{elapsed:.0f}s < {MIN_ELAPSED}s），疑似重复运行"
+    if elapsed > MAX_ELAPSED:
+        return "skip", f"间隔过长（{elapsed / 60:.0f}分钟），跨越休市或调度漂移，不判定"
+
+    prev_price = prev["price"]
+    price = quote["price"]
+    if not prev_price or not price:
+        return "skip", "价格缺失"
+
+    pct = (price - prev_price) / prev_price * 100.0
+    if abs(pct) < threshold:
+        return "skip", f"波动 {pct:+.2f}% 未达阈值 ±{threshold}%"
+
+    direction = "up" if pct > 0 else "down"
+    last_fired = state["last_trigger"].get(direction, 0.0)
+    if now - last_fired < COOLDOWN:
+        remain = (COOLDOWN - (now - last_fired)) / 60
+        return "cooldown", f"{direction} 方向冷却中，剩余 {remain:.0f} 分钟"
+
+    state["last_trigger"][direction] = now
+    return "alert", {
+        "direction": direction,
+        "pct": pct,
+        "elapsed": elapsed,
+        "prev_price": prev_price,
+    }
+
+
+# --------------------------------------------------------------------------
+# 4. 企业微信推送
+# --------------------------------------------------------------------------
+def build_message(quote, detail):
+    pct = detail["pct"]
+    direction_cn = "快速上涨" if pct > 0 else "快速下跌"
+    arrow = "▲" if pct > 0 else "▼"
+    minutes = detail["elapsed"] / 60
+    prev_close = quote.get("prev_close") or 0
+    day_pct = (quote["price"] - prev_close) / prev_close * 100 if prev_close else 0.0
+
+    return "\n".join([
+        "## ⚠️ 上海金 T+D 价格异动",
+        f"**{direction_cn} {arrow} {pct:+.2f}%**（约 {minutes:.0f} 分钟内）",
+        "",
+        f"> 现价：**{quote['price']:.2f}** 元/克",
+        f"> 起价：{detail['prev_price']:.2f} 元/克",
+        "",
+        f"今日累计：{day_pct:+.2f}%（昨收 {prev_close:.2f}）",
+        f"日内区间：{quote['low']:.2f} ~ {quote['high']:.2f}",
+        f"报价时间：{quote['quote_date']} {quote['quote_time']}",
+    ])
+
+
+def send_wecom(webhook, content):
+    payload = {"msgtype": "markdown", "markdown": {"content": content}}
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        webhook, data=data,
+        headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        body = resp.read().decode("utf-8", errors="replace")
+    result = json.loads(body)
+    if result.get("errcode") != 0:
+        raise RuntimeError(f"企业微信返回错误：{body}")
+    return result
+
+
+def test_webhook():
+    webhook = os.environ.get("WECOM_WEBHOOK", "").strip()
+    if not webhook:
+        print("[错误] 环境变量 WECOM_WEBHOOK 未设置。", file=sys.stderr)
+        return 1
+    content = "\n".join([
+        "## ✅ 金价监控已连通",
+        "这是一条测试消息，收到说明企业微信机器人配置正确。",
+        "",
+        f"> 发送时间：{datetime.now(CST):%Y-%m-%d %H:%M:%S}",
+    ])
+    try:
+        send_wecom(webhook, content)
+        print("[成功] 测试消息已发送，请检查企业微信群。")
+        return 0
+    except Exception as exc:                          # noqa: BLE001
+        print(f"[失败] {exc}", file=sys.stderr)
+        return 1
+
+
+# --------------------------------------------------------------------------
+# 5. 主流程
+# --------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="上海金 T+D 价格异动监控")
+    parser.add_argument("--state", default="state.json", help="状态文件路径")
+    parser.add_argument("--threshold", type=float, default=THRESHOLD_PCT,
+                        help=f"触发阈值百分比（默认 {THRESHOLD_PCT}）")
+    parser.add_argument("--dry-run", action="store_true", help="只打印，不推送")
+    args = parser.parse_args()
+
+    now = datetime.now(CST)
+    now_epoch = now.timestamp()
+
+    quote = fetch_quote()
+    if not quote["price"]:
+        raise RuntimeError("行情返回价格为空")
+
+    quote_ts = quote_epoch(quote)
+    staleness = (now_epoch - quote_ts) if quote_ts else 0
+    state = load_state(args.state)
+    state["runs"] = state.get("runs", 0) + 1
+
+    print(f"[行情] {quote['name']}  现价 {quote['price']:.2f} 元/克"
+          f"  昨收 {quote['prev_close']:.2f}"
+          f"  区间 {quote['low']:.2f}~{quote['high']:.2f}")
+    print(f"[行情] 报价时间 {quote['quote_date']} {quote['quote_time']}"
+          f"（距今 {staleness:.0f} 秒）")
+
+    # 休市判断：行情长时间不刷新则只记录、不判定，避免用陈旧价格误报
+    if quote_ts and staleness > STALE_QUOTE:
+        print(f"[休市] 行情已 {staleness / 60:.0f} 分钟未更新，仅记录不判定。")
+        state["last"] = {"price": quote["price"], "epoch": now_epoch,
+                         "quote_time": f"{quote['quote_date']} {quote['quote_time']}"}
+        save_state(args.state, state)
+        return 0
+
+    verdict, detail = evaluate(quote, state, now_epoch, args.threshold)
+
+    if verdict == "alert":
+        message = build_message(quote, detail)
+        print(f"[告警] {detail['direction']} {detail['pct']:+.2f}%"
+              f"（{detail['elapsed'] / 60:.0f} 分钟）")
+        print("-" * 50)
+        print(message)
+        print("-" * 50)
+        webhook = os.environ.get("WECOM_WEBHOOK", "").strip()
+        if args.dry_run:
+            print("[跳过] --dry-run 模式，未推送。")
+        elif not webhook:
+            print("[警告] 未配置 WECOM_WEBHOOK，无法推送。", file=sys.stderr)
+        else:
+            send_wecom(webhook, message)
+            print("[推送] 已发送至企业微信。")
+    else:
+        print(f"[正常] {detail}")
+
+    # 无论是否告警都记录本次采样，作为下次比较的基准
+    state["last"] = {"price": quote["price"], "epoch": now_epoch,
+                     "quote_time": f"{quote['quote_date']} {quote['quote_time']}"}
+    save_state(args.state, state)
+    print(f"[状态] 已写入 {args.state}（累计运行 {state['runs']} 次）")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:                          # noqa: BLE001
+        print(f"[致命错误] {exc}", file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,61 @@
+name: 上海金 T+D 异动监控
+
+on:
+  schedule:
+    # 每 5 分钟一次（UTC 时间）。
+    # GitHub 不保证准时，负载高时可能延迟，脚本按「真实间隔」判定，
+    # 因此延迟只会导致漏报，不会误报。
+    - cron: '*/5 * * * *'
+  workflow_dispatch:      # 允许在 Actions 页面手动触发测试
+
+permissions:
+  contents: write         # 需要把 state.json 提交回仓库
+
+concurrency:
+  group: gold-monitor     # 防止两次运行互相覆盖状态
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 拉取仓库（含上次采样的状态）
+        uses: actions/checkout@v4
+
+      - name: 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 执行监控
+        env:
+          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+        run: python monitor.py
+
+      - name: 回写状态
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json
+
+          if git diff --quiet --cached; then
+            echo "状态未变化，跳过提交"
+            exit 0
+          fi
+
+          git commit -m "chore: 更新监控状态 [skip ci]"
+          BRANCH="$(git branch --show-current)"
+
+          for i in 1 2 3 4; do
+            if git pull --rebase --autostash origin "$BRANCH" && git push origin "$BRANCH"; then
+              echo "状态已回写"
+              exit 0
+            fi
+            echo "推送失败，5 秒后重试（第 $i 次）"
+            sleep 5
+          done
+
+          echo "::warning::状态回写失败，下次运行将基于较旧的基准判断"
+          exit 0
